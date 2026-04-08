@@ -37,6 +37,12 @@ def _strict_unit(value: float) -> float:
     return round(value, 4)
 
 
+def _strict_fraction(passed: float, total: int) -> float:
+    if total <= 0:
+        return 0.99
+    return _strict_unit(passed / total)
+
+
 def _inject_line_numbers(source: str) -> str:
     """Prefix each line with its 1-based line number (like `cat -n`)."""
     lines = source.splitlines()
@@ -96,7 +102,7 @@ def _run_tests_in_sandbox(patched_source: str, tests: list, task_id: str) -> flo
     Returns fraction of tests that pass (0.0–1.0).
     """
     if not tests:
-        return 1.0
+        return 0.99
 
     passed = 0
     for expr, expected in tests:
@@ -127,7 +133,7 @@ def _run_tests_in_sandbox(patched_source: str, tests: list, task_id: str) -> flo
         except Exception:
             pass
 
-    return passed / len(tests)
+    return _strict_fraction(passed, len(tests))
 
 
 def _run_hard_tests(patched_source: str, test_name: str, expected) -> float:
@@ -190,10 +196,10 @@ def _run_hard_tests(patched_source: str, test_name: str, expected) -> float:
         os.unlink(fname)
         output = proc.stdout.strip()
         if str(expected) == output or output == str(expected):
-            return 1.0
-        return 0.0
+            return 0.99
+        return 0.01
     except Exception:
-        return 0.0
+        return 0.01
 
 
 def _syntax_check(source: str) -> bool:
@@ -322,8 +328,8 @@ class PatchEditEnvironment:
                 )
                 reward += test_score * 0.40
 
-                if test_score >= 1.0:
-                    reward = min(reward, 1.0)
+                if test_score >= 0.99:
+                    reward = min(reward, 0.99)
                     patch_result = "applied"
                     message = f"All tests passed! Score: {reward:.3f}"
                     ep.done = True
