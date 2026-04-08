@@ -1,6 +1,20 @@
 """
 PatchEditEnvironment — core OpenEnv environment.
-Implements the full OpenEnv spec with rewards strictly in (0, 1).
+
+Implements the full OpenEnv spec:
+  reset(task_name) → StepResult
+  step(action)     → StepResult
+  state()          → PatchState
+
+Reward design (never binary):
+  +0.15  patch string is non-empty and references correct line numbers
+  +0.20  patch applies cleanly to the buggy source (no patch errors)
+  +0.25  patched code executes without ImportError / SyntaxError
+  +0.40  test-case oracle score (fraction of passing tests × 0.40)
+  Total max = 1.0 per step; best_score tracks episode maximum.
+
+Penalties:
+  -0.05  per attempt wasted after first failed apply (encourages efficiency)
 """
 
 import re
@@ -12,39 +26,25 @@ import tempfile
 import os
 from typing import Optional, Tuple
 
-# Import TASKS from your local server module
-try:
-    from server.tasks import TASKS
-except ImportError:
-    # Minimal fallback for standalone testing
-    TASKS = {
-        "easy_patch": {
-            "name": "Easy Patch",
-            "difficulty": "easy",
-            "num_bugs": 1,
-            "max_attempts": 5,
-            "buggy_source": "def add(a, b):\n    return a - b",
-            "bug_description": "Function subtracts instead of adding.",
-            "tests": [("add(1, 2)", 3)]
-        }
-    }
+from server.tasks import TASKS
+
 
 def _strict_unit(value: float) -> float:
-    """Forces score to be strictly within (0, 1) range."""
     if value <= 0.0:
         return 0.01
     if value >= 1.0:
         return 0.99
     return round(value, 4)
 
+
 def _strict_fraction(passed: float, total: int) -> float:
-    """Clamps test fractions to strict (0, 1) bounds."""
     if total <= 0:
         return 0.99
     return _strict_unit(passed / total)
 
+
 def _inject_line_numbers(source: str) -> str:
-    """Prefix each line with its 1-based line number."""
+    """Prefix each line with its 1-based line number (like `cat -n`)."""
     lines = source.splitlines()
     width = len(str(len(lines)))
     numbered = []
@@ -52,22 +52,17 @@ def _inject_line_numbers(source: str) -> str:
         numbered.append(f"{i:>{width}}\t{line}")
     return "\n".join(numbered)
 
-def _strip_line_number_prefixes(text: str) -> str:
-    """Remove line-number echoes from agent output before patching."""
-    cleaned = []
-    for line in text.splitlines():
-        if line.startswith(("---", "+++", "@@", "-", "+", " ", "\\")):
-            cleaned.append(line)
-        else:
-            stripped = re.sub(r"^\s*\d+\t", "", line)
-            cleaned.append(stripped)
-    return "\n".join(cleaned)
 
 def _apply_patch(original_source: str, patch_str: str) -> Tuple[bool, str]:
-    """Applies patch via CLI patch utility."""
+    """
+    Try to apply patch_str to original_source using the `patch` command.
+    Returns (success, patched_source_or_error_msg).
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         orig_path = os.path.join(tmpdir, "code.py")
         patch_path = os.path.join(tmpdir, "fix.patch")
+
+        # Strip line-number prefixes the agent may have accidentally left in
         cleaned_patch = _strip_line_number_prefixes(patch_str)
 
         with open(orig_path, "w") as f:
@@ -86,22 +81,43 @@ def _apply_patch(original_source: str, patch_str: str) -> Tuple[bool, str]:
         else:
             return False, result.stderr or result.stdout
 
+
+def _strip_line_number_prefixes(text: str) -> str:
+    """Remove lines like '  42\t' that the agent may echo from the numbered source."""
+    cleaned = []
+    for line in text.splitlines():
+        # Don't touch diff headers/hunks
+        if line.startswith(("---", "+++", "@@", "-", "+", " ", "\\")):
+            cleaned.append(line)
+        else:
+            # Strip leading number+tab if present
+            stripped = re.sub(r"^\s*\d+\t", "", line)
+            cleaned.append(stripped)
+    return "\n".join(cleaned)
+
+
 def _run_tests_in_sandbox(patched_source: str, tests: list, task_id: str) -> float:
-    """Executes code and checks test expressions."""
+    """
+    Execute patched_source in a subprocess then run each test expression.
+    Returns fraction of tests that pass (0.0–1.0).
+    """
     if not tests:
         return 0.99
 
     passed = 0
     for expr, expected in tests:
+        # Build test harness
         if task_id == "hard_patch":
-            passed += _run_hard_tests(patched_source, expr, expected)
+            score = _run_hard_tests(patched_source, expr, expected)
+            passed += score
             continue
 
         test_code = textwrap.dedent(f"""\
             {patched_source}
+
             _result = {expr}
             _expected = {repr(expected)}
-            assert _result == _expected
+            assert _result == _expected, f"Got {{_result!r}}, expected {{_expected!r}}"
         """)
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -119,38 +135,99 @@ def _run_tests_in_sandbox(patched_source: str, tests: list, task_id: str) -> flo
 
     return _strict_fraction(passed, len(tests))
 
+
 def _run_hard_tests(patched_source: str, test_name: str, expected) -> float:
-    """Specialized test logic for complex tasks."""
+    """Specialised test runner for hard task semantic checks."""
     harnesses = {
-        "_lru_cache_key_test": "{src}\nc = LRUCache(4)\n@c.cached\ndef fn(x): return x*2\nprint('cache_hit' if fn(5)==fn(5)==10 else 'cache_miss')",
-        "_retry_exc_type_test": "{src}\n@retry(max_attempts=2, exceptions=(ValueError,))\ndef f(): raise ValueError('oops')\ntry: f()\nexcept ValueError: print('ValueError')",
+        "_lru_cache_key_test": textwrap.dedent("""\
+            {src}
+            c = LRUCache(4)
+            @c.cached
+            def fn(x): return x * 2
+            r1 = fn(5)
+            r2 = fn(5)
+            # If cache key is correct, both calls return same object
+            print("cache_hit" if r1 == r2 == 10 else "cache_miss")
+        """),
+        "_retry_exc_type_test": textwrap.dedent("""\
+            {src}
+            @retry(max_attempts=2, delay=0, exceptions=(ValueError,))
+            def always_fails():
+                raise ValueError("oops")
+            try:
+                always_fails()
+            except ValueError:
+                print("ValueError")
+            except Exception as e:
+                print(type(e).__name__)
+        """),
+        "_rate_limiter_reset_test": textwrap.dedent("""\
+            import time
+            {src}
+            rl = RateLimiter(max_calls=2, period=0.05)
+            rl.is_allowed()
+            rl.is_allowed()
+            time.sleep(0.1)
+            result = rl.is_allowed()
+            print(result)
+        """),
+        "_hard_integration_test": textwrap.dedent("""\
+            {src}
+            c = LRUCache(4)
+            @c.cached
+            def add(a, b): return a + b
+            assert add(1, 2) == 3
+            rl = RateLimiter(max_calls=5, period=1.0)
+            assert rl.is_allowed() is True
+            print(True)
+        """),
     }
+
     harness = harnesses.get(test_name, "print(False)")
     code = harness.format(src=patched_source)
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(code)
             fname = f.name
-        proc = subprocess.run([sys.executable, fname], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(
+            [sys.executable, fname],
+            capture_output=True, text=True, timeout=15
+        )
         os.unlink(fname)
-        return 1.0 if str(expected) == proc.stdout.strip() else 0.0
-    except:
-        return 0.0
+        output = proc.stdout.strip()
+        if str(expected) == output or output == str(expected):
+            return 0.99
+        return 0.01
+    except Exception:
+        return 0.01
+
 
 def _syntax_check(source: str) -> bool:
+    """Return True if source compiles without SyntaxError."""
     try:
         compile(source, "<string>", "exec")
         return True
-    except:
+    except SyntaxError:
         return False
 
+
 def _score_patch_format(patch_str: str, numbered_source: str) -> float:
-    if not patch_str.strip(): return 0.01
+    """
+    Heuristic: does the patch reference line numbers that exist in the source?
+    Returns 0.0–0.15.
+    """
+    if not patch_str.strip():
+        return 0.0
+    # Count total lines
     total_lines = numbered_source.count("\n") + 1
+    # Find @@ -N ... @@ hunk headers
     hunk_lines = re.findall(r"@@\s*-(\d+)", patch_str)
-    if not hunk_lines: return 0.05
+    if not hunk_lines:
+        return 0.05  # has content but no valid hunks
+    # Check line numbers are plausible
     valid = all(1 <= int(ln) <= total_lines + 5 for ln in hunk_lines)
     return 0.15 if valid else 0.05
+
 
 class EpisodeState:
     def __init__(self, task_id: str):
@@ -160,42 +237,67 @@ class EpisodeState:
         self.step_count = 0
         self.done = False
         self.total_reward = 0.0
-        self.best_score = 0.01
+        self.best_score = 0.0
         self.attempts_used = 0
         self.max_attempts = self.task["max_attempts"]
         self.numbered_source = _inject_line_numbers(self.task["buggy_source"])
         self.last_patch_result: Optional[str] = None
-        self.last_reward: float = 0.01
+        self.last_reward: float = 0.0
+
+    def attempts_remaining(self) -> int:
+        return self.max_attempts - self.attempts_used
+
 
 class PatchEditEnvironment:
+    """
+    The main OpenEnv environment class.
+    One instance is shared across requests; each reset() creates a new EpisodeState.
+    """
+
     def __init__(self):
         self._episode: Optional[EpisodeState] = None
 
+    # ------------------------------------------------------------------
+    # OpenEnv API
+    # ------------------------------------------------------------------
+
     def reset(self, task_name: str = "easy_patch") -> dict:
-        if task_name not in TASKS: task_name = "easy_patch"
+        if task_name not in TASKS:
+            task_name = "easy_patch"
         self._episode = EpisodeState(task_name)
         ep = self._episode
-        res_reward = _strict_unit(0.0)
         return {
             "observation": {
                 "numbered_source": ep.numbered_source,
                 "bug_description": ep.task["bug_description"],
                 "task_id": ep.task_id,
                 "last_patch_result": None,
-                "last_reward": res_reward,
+                "last_reward": 0.01,
                 "attempts_remaining": ep.attempts_remaining(),
-                "message": f"Task: {ep.task['name']}. {ep.max_attempts} attempts allowed.",
+                "message": (
+                    f"Episode started. Task: {ep.task['name']} ({ep.task['difficulty']}). "
+                    f"You have {ep.max_attempts} attempts."
+                ),
             },
-            "reward": res_reward,
+            "reward": 0.01,
             "done": False,
-            "info": {"episode_id": ep.episode_id, "task": ep.task["name"]},
+            "info": {
+                "episode_id": ep.episode_id,
+                "task": ep.task["name"],
+                "difficulty": ep.task["difficulty"],
+                "num_bugs": ep.task["num_bugs"],
+                "max_attempts": ep.max_attempts,
+            },
         }
 
     def step(self, action: dict) -> dict:
         ep = self._episode
-        if ep is None or ep.done: return self._terminal_result(ep)
+        if ep is None or ep.done:
+            return self._terminal_result(ep)
 
         patch_str = action.get("patch", "")
+        architect_plan = action.get("architect_plan", "")
+
         ep.step_count += 1
         ep.attempts_used += 1
 
@@ -203,38 +305,63 @@ class PatchEditEnvironment:
         patch_result = "failed_to_apply"
         message = ""
 
-        # 1. Format
-        reward += _score_patch_format(patch_str, ep.numbered_source)
+        # --- Component 1: patch format score (0.0–0.15) ---
+        fmt_score = _score_patch_format(patch_str, ep.numbered_source)
+        reward += fmt_score
 
-        # 2. Apply
-        ok, patched = _apply_patch(ep.task["buggy_source"], patch_str)
-        if ok:
+        # --- Component 2: apply patch (0.0 or +0.20) ---
+        apply_ok, patched_or_err = _apply_patch(ep.task["buggy_source"], patch_str)
+
+        if apply_ok:
+            patched_source = patched_or_err
             reward += 0.20
             patch_result = "applied"
-            # 3. Syntax
-            if _syntax_check(patched):
-                reward += 0.10
-                # 4. Tests
-                test_score = _run_tests_in_sandbox(patched, ep.task["tests"], ep.task_id)
-                reward += (test_score * 0.40)
+
+            # --- Component 3: syntax check (+0.25) ---
+            if _syntax_check(patched_source):
+                reward += 0.10  # partial for valid syntax
+                message = "Patch applied and syntax OK. Running tests..."
+
+                # --- Component 4: test oracle (0.0–0.40) ---
+                test_score = _run_tests_in_sandbox(
+                    patched_source, ep.task["tests"], ep.task_id
+                )
+                reward += test_score * 0.40
+
                 if test_score >= 0.99:
-                    message = "All tests passed!"
+                    reward = min(reward, 0.99)
+                    patch_result = "applied"
+                    message = f"All tests passed! Score: {reward:.3f}"
                     ep.done = True
+                elif test_score > 0:
+                    patch_result = "applied"
+                    message = (
+                        f"Patch applied. {test_score*100:.0f}% tests pass. "
+                        f"Partial reward: {reward:.3f}. Try again."
+                    )
                 else:
-                    message = f"Applied. {test_score*100:.0f}% pass."
+                    patch_result = "wrong_output"
+                    message = f"Patch applied but tests fail. Reward: {reward:.3f}. Rethink the fix."
             else:
-                message = "Syntax error in patch."
+                patch_result = "wrong_output"
+                message = "Patch applied but produced syntax errors in the result."
         else:
-            if ep.attempts_used > 1: reward -= 0.05
-            message = f"Patch error: {patched[:50]}"
+            # Patch failed to apply — penalise wasted attempts (after first)
+            if ep.attempts_used > 1:
+                reward = max(0.0, fmt_score - 0.05)
+            message = f"Patch failed to apply: {patched_or_err[:200]}"
 
-        final_reward = _strict_unit(reward)
-        ep.total_reward += final_reward
-        ep.best_score = _strict_unit(max(ep.best_score, final_reward))
+        # Clamp reward
+        reward = _strict_unit(min(max(reward, 0.0), 1.0))
+        ep.total_reward += reward
+        ep.best_score = _strict_unit(max(ep.best_score, reward))
         ep.last_patch_result = patch_result
-        ep.last_reward = final_reward
+        ep.last_reward = reward
 
-        if ep.attempts_remaining() <= 0: ep.done = True
+        # Out of attempts?
+        if ep.attempts_remaining() <= 0 and not ep.done:
+            ep.done = True
+            message += f" No attempts remaining. Best score: {ep.best_score:.3f}."
 
         return {
             "observation": {
@@ -242,29 +369,50 @@ class PatchEditEnvironment:
                 "bug_description": ep.task["bug_description"],
                 "task_id": ep.task_id,
                 "last_patch_result": patch_result,
-                "last_reward": final_reward,
+                "last_reward": reward,
                 "attempts_remaining": ep.attempts_remaining(),
                 "message": message,
             },
-            "reward": final_reward,
+            "reward": reward,
             "done": ep.done,
-            "info": {"step": ep.step_count, "best_score": ep.best_score},
+            "info": {
+                "episode_id": ep.episode_id,
+                "step": ep.step_count,
+                "total_reward": ep.total_reward,
+                "best_score": ep.best_score,
+                "architect_plan_received": bool(architect_plan),
+                "score": reward,
+            },
         }
 
     def state(self) -> dict:
         ep = self._episode
-        if not ep: return {"total_reward": 0.01, "best_score": 0.01, "done": True}
+        if ep is None:
+            return {
+                "episode_id": "none",
+                "task_id": "none",
+                "step_count": 0,
+                "done": True,
+                "total_reward": 0.01,
+                "best_score": 0.01,
+            }
         return {
             "episode_id": ep.episode_id,
+            "task_id": ep.task_id,
             "step_count": ep.step_count,
             "done": ep.done,
             "total_reward": _strict_unit(ep.total_reward),
-            "best_score": ep.best_score,
+            "best_score": _strict_unit(ep.best_score),
         }
 
     def _terminal_result(self, ep) -> dict:
-        r = 0.01
-        return {
-            "observation": {"last_patch_result": "done", "last_reward": r, "message": "Finished."},
-            "reward": r, "done": True, "info": {"score": r}
+        obs = {
+            "numbered_source": ep.numbered_source if ep else "",
+            "bug_description": ep.task["bug_description"] if ep else "",
+            "task_id": ep.task_id if ep else "none",
+            "last_patch_result": "episode_done",
+            "last_reward": 0.01,
+            "attempts_remaining": 0,
+            "message": "Episode already finished. Call /reset to start a new one.",
         }
+        return {"observation": obs, "reward": 0.01, "done": True, "info": {"score": 0.01}}
