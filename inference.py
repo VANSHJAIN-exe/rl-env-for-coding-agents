@@ -119,6 +119,14 @@ def log_end(task_id: str, episode_id: str, total_reward: float, best_score: floa
     )
 
 
+def bounded_score(value: float) -> float:
+    if value <= 0.0:
+        return 0.01
+    if value >= 1.0:
+        return 0.99
+    return value
+
+
 async def run_task(env: EnvClient, llm: AsyncOpenAI, model_name: str, task_id: str) -> None:
     reset_result = await env.reset(task_id)
     info = reset_result["info"]
@@ -144,7 +152,13 @@ async def run_task(env: EnvClient, llm: AsyncOpenAI, model_name: str, task_id: s
         )
 
     state = await env.state()
-    log_end(task_id, state.episode_id, state.total_reward, state.best_score, state.done)
+    log_end(
+        task_id,
+        state.episode_id,
+        bounded_score(float(state.total_reward)),
+        bounded_score(float(state.best_score)),
+        state.done,
+    )
 
 
 async def main() -> None:
