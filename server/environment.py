@@ -378,7 +378,7 @@ class PatchEditEnvironment:
             "info": {
                 "episode_id": ep.episode_id,
                 "step": ep.step_count,
-                "total_reward": ep.total_reward,
+                "total_reward": _strict_unit(ep.total_reward),  # FIX: clamp raw sum
                 "best_score": ep.best_score,
                 "architect_plan_received": bool(architect_plan),
                 "score": reward,
