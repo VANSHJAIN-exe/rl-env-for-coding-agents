@@ -62,7 +62,6 @@ def _apply_patch(original_source: str, patch_str: str) -> Tuple[bool, str]:
         orig_path = os.path.join(tmpdir, "code.py")
         patch_path = os.path.join(tmpdir, "fix.patch")
 
-        # Strip line-number prefixes the agent may have accidentally left in
         cleaned_patch = _strip_line_number_prefixes(patch_str)
 
         with open(orig_path, "w") as f:
@@ -86,11 +85,9 @@ def _strip_line_number_prefixes(text: str) -> str:
     """Remove lines like '  42\t' that the agent may echo from the numbered source."""
     cleaned = []
     for line in text.splitlines():
-        # Don't touch diff headers/hunks
         if line.startswith(("---", "+++", "@@", "-", "+", " ", "\\")):
             cleaned.append(line)
         else:
-            # Strip leading number+tab if present
             stripped = re.sub(r"^\s*\d+\t", "", line)
             cleaned.append(stripped)
     return "\n".join(cleaned)
@@ -106,7 +103,6 @@ def _run_tests_in_sandbox(patched_source: str, tests: list, task_id: str) -> flo
 
     passed = 0
     for expr, expected in tests:
-        # Build test harness
         if task_id == "hard_patch":
             score = _run_hard_tests(patched_source, expr, expected)
             passed += score
@@ -146,7 +142,6 @@ def _run_hard_tests(patched_source: str, test_name: str, expected) -> float:
             def fn(x): return x * 2
             r1 = fn(5)
             r2 = fn(5)
-            # If cache key is correct, both calls return same object
             print("cache_hit" if r1 == r2 == 10 else "cache_miss")
         """),
         "_retry_exc_type_test": textwrap.dedent("""\
@@ -214,17 +209,14 @@ def _syntax_check(source: str) -> bool:
 def _score_patch_format(patch_str: str, numbered_source: str) -> float:
     """
     Heuristic: does the patch reference line numbers that exist in the source?
-    Returns 0.0–0.15.
+    Always returns strictly within (0, 1).
     """
     if not patch_str.strip():
-        return 0.0
-    # Count total lines
+        return 0.01  # FIX: was 0.0 — must be strictly > 0
     total_lines = numbered_source.count("\n") + 1
-    # Find @@ -N ... @@ hunk headers
     hunk_lines = re.findall(r"@@\s*-(\d+)", patch_str)
     if not hunk_lines:
-        return 0.05  # has content but no valid hunks
-    # Check line numbers are plausible
+        return 0.05
     valid = all(1 <= int(ln) <= total_lines + 5 for ln in hunk_lines)
     return 0.15 if valid else 0.05
 
@@ -256,10 +248,6 @@ class PatchEditEnvironment:
 
     def __init__(self):
         self._episode: Optional[EpisodeState] = None
-
-    # ------------------------------------------------------------------
-    # OpenEnv API
-    # ------------------------------------------------------------------
 
     def reset(self, task_name: str = "easy_patch") -> dict:
         if task_name not in TASKS:
@@ -305,11 +293,11 @@ class PatchEditEnvironment:
         patch_result = "failed_to_apply"
         message = ""
 
-        # --- Component 1: patch format score (0.0–0.15) ---
+        # --- Component 1: patch format score (always strictly > 0) ---
         fmt_score = _score_patch_format(patch_str, ep.numbered_source)
         reward += fmt_score
 
-        # --- Component 2: apply patch (0.0 or +0.20) ---
+        # --- Component 2: apply patch (+0.20) ---
         apply_ok, patched_or_err = _apply_patch(ep.task["buggy_source"], patch_str)
 
         if apply_ok:
@@ -317,9 +305,9 @@ class PatchEditEnvironment:
             reward += 0.20
             patch_result = "applied"
 
-            # --- Component 3: syntax check (+0.25) ---
+            # --- Component 3: syntax check (+0.10) ---
             if _syntax_check(patched_source):
-                reward += 0.10  # partial for valid syntax
+                reward += 0.10
                 message = "Patch applied and syntax OK. Running tests..."
 
                 # --- Component 4: test oracle (0.0–0.40) ---
@@ -346,19 +334,17 @@ class PatchEditEnvironment:
                 patch_result = "wrong_output"
                 message = "Patch applied but produced syntax errors in the result."
         else:
-            # Patch failed to apply — penalise wasted attempts (after first)
             if ep.attempts_used > 1:
                 reward = max(0.0, fmt_score - 0.05)
             message = f"Patch failed to apply: {patched_or_err[:200]}"
 
-        # Clamp reward
+        # Clamp reward — always strictly within (0, 1)
         reward = _strict_unit(min(max(reward, 0.0), 1.0))
         ep.total_reward += reward
         ep.best_score = _strict_unit(max(ep.best_score, reward))
         ep.last_patch_result = patch_result
         ep.last_reward = reward
 
-        # Out of attempts?
         if ep.attempts_remaining() <= 0 and not ep.done:
             ep.done = True
             message += f" No attempts remaining. Best score: {ep.best_score:.3f}."
@@ -378,7 +364,7 @@ class PatchEditEnvironment:
             "info": {
                 "episode_id": ep.episode_id,
                 "step": ep.step_count,
-                "total_reward": _strict_unit(ep.total_reward),  # FIX: clamp raw sum
+                "total_reward": _strict_unit(ep.total_reward),  # FIX: clamp raw cumulative sum
                 "best_score": ep.best_score,
                 "architect_plan_received": bool(architect_plan),
                 "score": reward,
