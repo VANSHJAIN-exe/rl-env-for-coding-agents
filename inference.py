@@ -108,23 +108,24 @@ def log_start(task_id: str, episode_id: str) -> None:
 def log_step(task_id: str, episode_id: str, step: int, reward: float, done: bool, status: str) -> None:
     print(
         f"[STEP] task_id={task_id} episode_id={episode_id} "
-        f"step={step} reward={reward:.4f} done={done} status={status}"
+        f"step={step} reward={bounded_score(reward):.4f} done={done} status={status}"
     )
 
 
 def log_end(task_id: str, episode_id: str, total_reward: float, best_score: float, done: bool) -> None:
     print(
         f"[END] task_id={task_id} episode_id={episode_id} "
-        f"total_reward={total_reward:.4f} best_score={best_score:.4f} done={done}"
+        f"total_reward={bounded_score(total_reward):.4f} best_score={bounded_score(best_score):.4f} done={done}"
     )
 
 
 def bounded_score(value: float) -> float:
+    """Ensure score is strictly within (0, 1) — never 0.0 or 1.0."""
     if value <= 0.0:
         return 0.01
     if value >= 1.0:
         return 0.99
-    return value
+    return round(value, 4)
 
 
 async def run_task(env: EnvClient, llm: AsyncOpenAI, model_name: str, task_id: str) -> None:
@@ -146,7 +147,7 @@ async def run_task(env: EnvClient, llm: AsyncOpenAI, model_name: str, task_id: s
             task_id,
             episode_id,
             step,
-            float(step_result["reward"]),
+            bounded_score(float(step_result["reward"])),
             done,
             observation["last_patch_result"] or "none",
         )
