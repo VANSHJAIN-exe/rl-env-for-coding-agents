@@ -101,24 +101,6 @@ async def choose_action(
     return PatchAction(patch=patch, architect_plan=f"Apply the known fix for {task_id}.")
 
 
-def log_start(task_id: str, episode_id: str) -> None:
-    print(f"[START] task_id={task_id} episode_id={episode_id}")
-
-
-def log_step(task_id: str, episode_id: str, step: int, reward: float, done: bool, status: str) -> None:
-    print(
-        f"[STEP] task_id={task_id} episode_id={episode_id} "
-        f"step={step} reward={bounded_score(reward):.4f} done={done} status={status}"
-    )
-
-
-def log_end(task_id: str, episode_id: str, total_reward: float, best_score: float, done: bool) -> None:
-    print(
-        f"[END] task_id={task_id} episode_id={episode_id} "
-        f"total_reward={bounded_score(total_reward):.4f} best_score={bounded_score(best_score):.4f} done={done}"
-    )
-
-
 def bounded_score(value: float) -> float:
     """Ensure score is strictly within (0, 1) — never 0.0 or 1.0."""
     if value <= 0.0:
@@ -128,38 +110,60 @@ def bounded_score(value: float) -> float:
     return round(value, 4)
 
 
-async def run_task(env: EnvClient, llm: AsyncOpenAI, model_name: str, task_id: str) -> None:
+def log_start(task_id: str, env: str, model: str) -> None:
+    print(f"[START] task={task_id} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, reward: float, done: bool, status: str) -> None:
+    print(
+        f"[STEP] step={step} reward={bounded_score(reward):.4f} done={str(done).lower()} status={status}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{bounded_score(r):.4f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={bounded_score(score):.4f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+async def run_task(
+    env: EnvClient,
+    llm: AsyncOpenAI,
+    model_name: str,
+    task_id: str,
+    env_name: str,
+) -> float:
     reset_result = await env.reset(task_id)
-    info = reset_result["info"]
     observation = reset_result["observation"]
-    episode_id = info["episode_id"]
-    log_start(task_id, episode_id)
+    log_start(task_id, env_name, model_name)
 
     done = bool(reset_result["done"])
     step = 0
+    rewards: list[float] = []
+
     while not done and observation["attempts_remaining"] > 0:
         step += 1
         action = await choose_action(llm, model_name, task_id, observation)
         step_result = await env.step(action)
         observation = step_result["observation"]
         done = bool(step_result["done"])
+        reward = bounded_score(float(step_result["reward"]))
+        rewards.append(reward)
         log_step(
-            task_id,
-            episode_id,
             step,
-            bounded_score(float(step_result["reward"])),
+            reward,
             done,
             observation["last_patch_result"] or "none",
         )
 
     state = await env.state()
-    log_end(
-        task_id,
-        state.episode_id,
-        bounded_score(float(state.total_reward)),
-        bounded_score(float(state.best_score)),
-        state.done,
-    )
+    score = bounded_score(float(state.best_score))
+    success = score >= 0.95
+    log_end(success, step, score, rewards)
+    return score
 
 
 async def main() -> None:
@@ -167,6 +171,7 @@ async def main() -> None:
     model_name = _require_env("MODEL_NAME", "gpt-4o-mini")
     hf_token = _require_env("HF_TOKEN", "local-dev-token")
     env_base_url = os.getenv("ENV_BASE_URL", "http://127.0.0.1:8000")
+    env_name = "PatchEditEnv"
 
     llm = AsyncOpenAI(base_url=api_base_url.rstrip("/"), api_key=hf_token)
     env = EnvClient(base_url=env_base_url)
@@ -176,7 +181,7 @@ async def main() -> None:
 
     for task_id in ("easy_patch", "medium_patch", "hard_patch"):
         if task_id in tasks:
-            await run_task(env, llm, model_name, task_id)
+            await run_task(env, llm, model_name, task_id, env_name)
 
 
 if __name__ == "__main__":
