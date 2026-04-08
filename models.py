@@ -3,7 +3,16 @@ OpenEnv Typed Models for PatchEditEnv.
 Action, Observation, State — all Pydantic v2.
 """
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _clamp(v: float) -> float:
+    """Ensure value is strictly within (0, 1) — never 0.0 or 1.0."""
+    if v <= 0.0:
+        return 0.01
+    if v >= 1.0:
+        return 0.99
+    return round(v, 4)
 
 
 class PatchAction(BaseModel):
@@ -38,9 +47,14 @@ class PatchObservation(BaseModel):
         None,
         description="Feedback from previous attempt: applied | failed_to_apply | wrong_output | None.",
     )
-    last_reward: float = Field(0.0, description="Reward from the previous step.")
+    last_reward: float = Field(0.01, description="Reward from the previous step.")  # FIX: default 0.0 → 0.01
     attempts_remaining: int = Field(..., description="Remaining patch attempts before episode ends.")
     message: str = Field("", description="Human-readable status message.")
+
+    @field_validator("last_reward", mode="before")
+    @classmethod
+    def clamp_last_reward(cls, v: float) -> float:
+        return _clamp(float(v))
 
 
 class PatchState(BaseModel):
@@ -51,3 +65,8 @@ class PatchState(BaseModel):
     done: bool
     total_reward: float
     best_score: float
+
+    @field_validator("total_reward", "best_score", mode="before")
+    @classmethod
+    def clamp_scores(cls, v: float) -> float:
+        return _clamp(float(v))
