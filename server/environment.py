@@ -29,6 +29,14 @@ from typing import Optional, Tuple
 from server.tasks import TASKS
 
 
+def _strict_unit(value: float) -> float:
+    if value <= 0.0:
+        return 0.01
+    if value >= 1.0:
+        return 0.99
+    return round(value, 4)
+
+
 def _inject_line_numbers(source: str) -> str:
     """Prefix each line with its 1-based line number (like `cat -n`)."""
     lines = source.splitlines()
@@ -258,14 +266,14 @@ class PatchEditEnvironment:
                 "bug_description": ep.task["bug_description"],
                 "task_id": ep.task_id,
                 "last_patch_result": None,
-                "last_reward": 0.0,
+                "last_reward": 0.01,
                 "attempts_remaining": ep.attempts_remaining(),
                 "message": (
                     f"Episode started. Task: {ep.task['name']} ({ep.task['difficulty']}). "
                     f"You have {ep.max_attempts} attempts."
                 ),
             },
-            "reward": 0.0,
+            "reward": 0.01,
             "done": False,
             "info": {
                 "episode_id": ep.episode_id,
@@ -338,9 +346,9 @@ class PatchEditEnvironment:
             message = f"Patch failed to apply: {patched_or_err[:200]}"
 
         # Clamp reward
-        reward = round(min(max(reward, 0.0), 1.0), 4)
+        reward = _strict_unit(min(max(reward, 0.0), 1.0))
         ep.total_reward += reward
-        ep.best_score = max(ep.best_score, reward)
+        ep.best_score = _strict_unit(max(ep.best_score, reward))
         ep.last_patch_result = patch_result
         ep.last_reward = reward
 
@@ -367,6 +375,7 @@ class PatchEditEnvironment:
                 "total_reward": ep.total_reward,
                 "best_score": ep.best_score,
                 "architect_plan_received": bool(architect_plan),
+                "score": reward,
             },
         }
 
@@ -378,16 +387,16 @@ class PatchEditEnvironment:
                 "task_id": "none",
                 "step_count": 0,
                 "done": True,
-                "total_reward": 0.0,
-                "best_score": 0.0,
+                "total_reward": 0.01,
+                "best_score": 0.01,
             }
         return {
             "episode_id": ep.episode_id,
             "task_id": ep.task_id,
             "step_count": ep.step_count,
             "done": ep.done,
-            "total_reward": ep.total_reward,
-            "best_score": ep.best_score,
+            "total_reward": _strict_unit(ep.total_reward),
+            "best_score": _strict_unit(ep.best_score),
         }
 
     def _terminal_result(self, ep) -> dict:
@@ -396,8 +405,8 @@ class PatchEditEnvironment:
             "bug_description": ep.task["bug_description"] if ep else "",
             "task_id": ep.task_id if ep else "none",
             "last_patch_result": "episode_done",
-            "last_reward": 0.0,
+            "last_reward": 0.01,
             "attempts_remaining": 0,
             "message": "Episode already finished. Call /reset to start a new one.",
         }
-        return {"observation": obs, "reward": 0.0, "done": True, "info": {}}
+        return {"observation": obs, "reward": 0.01, "done": True, "info": {"score": 0.01}}
